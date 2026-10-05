@@ -45,7 +45,7 @@ import type {
   AdapterLoginPanelMode,
   AdapterLoginTimeoutPolicy,
 } from "@paperclipai/adapter-utils";
-import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter } from "../adapters/plugin-loader.js";
+import { loadExternalAdapterPackage, getUiParserSource, getOrExtractUiParserSource, reloadExternalAdapter, pruneReloadDirsForType } from "../adapters/plugin-loader.js";
 import { logger } from "../middleware/logger.js";
 import { forbidden } from "../errors.js";
 import { isCloudManagedInstance } from "../services/cloud-instance.js";
@@ -578,6 +578,9 @@ export function adapterRoutes(options: {
 
     // Remove from the persistent store
     removeAdapterPlugin(adapterType);
+
+    // Reclaim reload staging copies. A reload racing uninstall fails safe with a 500.
+    pruneReloadDirsForType(adapterType);
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");
 

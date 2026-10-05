@@ -9,7 +9,7 @@
  * adapter-utils, never registry.ts.
  */
 
-import { randomUUID } from "node:crypto";
+import { createHash, randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -216,6 +216,7 @@ async function loadFromRecord(record: AdapterPluginRecord): Promise<ServerAdapte
 }
 
 const RELOAD_DIR_PREFIX = ".reload-";
+const RELOAD_DIR_TTL_MS = 3_600_000;
 const activeReloadDirs = new Map<string, string>();
 const reloadChains = new Map<string, Promise<ServerAdapterModule | null>>();
 
@@ -223,8 +224,39 @@ function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
 }
 
+export function sanitizeReloadDirSegment(type: string): string {
+  return type.replace(/[^A-Za-z0-9_-]/g, "_");
+}
+
+function reloadDirPrefixForType(type: string): string {
+  return RELOAD_DIR_PREFIX + sanitizeReloadDirSegment(type);
+}
+
+function dirHashForType(type: string): string {
+  return createHash("sha256").update(type, "utf8").digest("hex").slice(0, 8);
+}
+
+export function reloadDirNameForType(type: string): string {
+  return `${reloadDirPrefixForType(type)}-${dirHashForType(type)}-${Date.now()}-${randomUUID()}`;
+}
+
 export function isReloadDirEntry(entry: string, type: string): boolean {
-  return new RegExp(`^${escapeRegExp(RELOAD_DIR_PREFIX + type)}-\\d+-[0-9a-f-]{36}$`).test(entry);
+  const prefix = escapeRegExp(reloadDirPrefixForType(type));
+  const tail = "-\\d+-[0-9a-f-]{36}$";
+  if (new RegExp(`^${prefix}-${dirHashForType(type)}${tail}`).test(entry)) return true;
+  return new RegExp(`^${prefix}${tail}`).test(entry);
+}
+
+export function isAnyReloadDirEntry(entry: string): boolean {
+  return /^\.reload-.*-\d+-[0-9a-f-]{36}$/.test(entry);
+}
+
+function isExpiredReloadDir(pluginsDir: string, entry: string): boolean {
+  try {
+    return Date.now() - fs.statSync(path.join(pluginsDir, entry)).mtimeMs >= RELOAD_DIR_TTL_MS;
+  } catch {
+    return false;
+  }
 }
 
 function pruneStaleReloadDirs(pluginsDir: string, type: string, keepDirs: string[]): void {
@@ -238,11 +270,62 @@ function pruneStaleReloadDirs(pluginsDir: string, type: string, keepDirs: string
   for (const entry of entries) {
     if (!isReloadDirEntry(entry, type)) continue;
     if (keep.has(path.resolve(pluginsDir, entry))) continue;
+    if (!isExpiredReloadDir(pluginsDir, entry)) continue;
     try {
       fs.rmSync(path.join(pluginsDir, entry), { recursive: true, force: true });
     } catch {
       // Leave it; the next reload retries.
     }
+  }
+}
+
+export function pruneReloadDirsForType(type: string): void {
+  const pluginsDir = getAdapterPluginsDir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsDir);
+  } catch {
+    return;
+  }
+  for (const entry of entries) {
+    if (!isReloadDirEntry(entry, type)) continue;
+    removeReloadDir(path.join(pluginsDir, entry));
+  }
+  activeReloadDirs.delete(type);
+}
+
+export function pruneAllReloadDirs(): void {
+  const pluginsDir = getAdapterPluginsDir();
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsDir);
+  } catch {
+    return;
+  }
+  const keep = new Set([...activeReloadDirs.values()].map((dir) => path.resolve(dir)));
+  for (const entry of entries) {
+    if (!isAnyReloadDirEntry(entry)) continue;
+    if (keep.has(path.resolve(pluginsDir, entry))) continue;
+    removeReloadDir(path.join(pluginsDir, entry));
+  }
+}
+
+function linkSelfImport(reloadDir: string, packageName: string): void {
+  const segments = packageName.split("/");
+  if (
+    segments.length === 0 ||
+    segments.some((segment) => !segment || segment === "." || segment === ".." || segment.includes("\\"))
+  ) {
+    logger.warn({ packageName }, "Skipping self-import link for malformed package name");
+    return;
+  }
+  const linkDir = path.join(reloadDir, "node_modules", ...segments.slice(0, -1));
+  const linkPath = path.join(linkDir, segments[segments.length - 1]);
+  try {
+    fs.mkdirSync(linkDir, { recursive: true });
+    fs.symlinkSync(reloadDir, linkPath, "junction");
+  } catch (err) {
+    logger.warn({ err, packageName }, "Failed to link self-import in reload copy; bare self-imports stay stale");
   }
 }
 
@@ -281,7 +364,7 @@ async function reloadInner(type: string): Promise<ServerAdapterModule | null> {
 
   const packageDir = resolvePackageDir(record);
   const pluginsDir = getAdapterPluginsDir();
-  const reloadDir = path.join(pluginsDir, `${RELOAD_DIR_PREFIX}${type}-${Date.now()}-${randomUUID()}`);
+  const reloadDir = path.join(pluginsDir, reloadDirNameForType(type));
   let entryPoint: string;
   try {
     entryPoint = resolvePackageEntryPoint(packageDir);
@@ -289,6 +372,7 @@ async function reloadInner(type: string): Promise<ServerAdapterModule | null> {
     // otherwise they resolve back to the source tree (measured: without
     // verbatimSymlinks a ./nested.js link is recreated as an absolute path).
     fs.cpSync(packageDir, reloadDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+    linkSelfImport(reloadDir, record.packageName);
   } catch (err) {
     removeReloadDir(reloadDir);
     throw new Error(
@@ -340,6 +424,7 @@ async function reloadInner(type: string): Promise<ServerAdapterModule | null> {
 export async function buildExternalAdapters(): Promise<ServerAdapterModule[]> {
   const results: ServerAdapterModule[] = [];
 
+  pruneAllReloadDirs();
   const storeRecords = listAdapterPlugins();
   for (const record of storeRecords) {
     const adapter = await loadFromRecord(record);
