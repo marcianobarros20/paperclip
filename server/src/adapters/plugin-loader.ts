@@ -9,6 +9,7 @@
  * adapter-utils, never registry.ts.
  */
 
+import { randomUUID } from "node:crypto";
 import fs from "node:fs";
 import path from "node:path";
 import { pathToFileURL } from "node:url";
@@ -214,57 +215,123 @@ async function loadFromRecord(record: AdapterPluginRecord): Promise<ServerAdapte
   }
 }
 
+const RELOAD_DIR_PREFIX = ".reload-";
+const activeReloadDirs = new Map<string, string>();
+const reloadChains = new Map<string, Promise<ServerAdapterModule | null>>();
+
+function escapeRegExp(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+}
+
+export function isReloadDirEntry(entry: string, type: string): boolean {
+  return new RegExp(`^${escapeRegExp(RELOAD_DIR_PREFIX + type)}-\\d+-[0-9a-f-]{36}$`).test(entry);
+}
+
+function pruneStaleReloadDirs(pluginsDir: string, type: string, keepDirs: string[]): void {
+  let entries: string[];
+  try {
+    entries = fs.readdirSync(pluginsDir);
+  } catch {
+    return;
+  }
+  const keep = new Set(keepDirs.map((dir) => path.resolve(dir)));
+  for (const entry of entries) {
+    if (!isReloadDirEntry(entry, type)) continue;
+    if (keep.has(path.resolve(pluginsDir, entry))) continue;
+    try {
+      fs.rmSync(path.join(pluginsDir, entry), { recursive: true, force: true });
+    } catch {
+      // Leave it; the next reload retries.
+    }
+  }
+}
+
+function removeReloadDir(dir: string): void {
+  try {
+    fs.rmSync(dir, { recursive: true, force: true });
+  } catch {
+    // Leave it; prune on the next reload retries.
+  }
+}
+
 /**
  * Reload an external adapter at runtime (dev iteration without server restart).
- * Busts the ESM module cache via a cache-busting query string.
+ * Imports from a unique copy of the package directory: a query string busts
+ * only the entry point while nested relative imports resolve to cached URLs.
+ * Returns null only when no plugin record exists; staging and import failures
+ * throw so routes report 500 with the cause instead of a misleading 404. The
+ * previous module stays registered on every failure path.
  */
 export async function reloadExternalAdapter(
   type: string,
 ): Promise<ServerAdapterModule | null> {
+  const previousRun = reloadChains.get(type) ?? Promise.resolve(null);
+  const run = previousRun.catch(() => null).then(() => reloadInner(type));
+  reloadChains.set(type, run);
+  try {
+    return await run;
+  } finally {
+    if (reloadChains.get(type) === run) reloadChains.delete(type);
+  }
+}
+
+async function reloadInner(type: string): Promise<ServerAdapterModule | null> {
   const record = getAdapterPluginByType(type);
   if (!record) return null;
 
   const packageDir = resolvePackageDir(record);
-  const entryPoint = resolvePackageEntryPoint(packageDir);
-  const modulePath = path.resolve(packageDir, entryPoint);
-  const fileUrl = pathToFileURL(modulePath).href;
-
-  // Bust ESM module cache so re-import loads fresh code from disk.
-  // Query-string trick (?t=...) works in Node; Bun may need the file:// URL
-  // to be evicted from its internal registry first.
+  const pluginsDir = getAdapterPluginsDir();
+  const reloadDir = path.join(pluginsDir, `${RELOAD_DIR_PREFIX}${type}-${Date.now()}-${randomUUID()}`);
+  let entryPoint: string;
   try {
-    // @ts-expect-error -- Bun internal module cache
-    const bunCache = globalThis.Bun?.__moduleCache as Map<string, unknown> | undefined;
-    if (bunCache) {
-      bunCache.delete(fileUrl);
-      bunCache.delete(modulePath);
+    entryPoint = resolvePackageEntryPoint(packageDir);
+    // Verbatim symlinks: relative links must keep pointing inside the copy,
+    // otherwise they resolve back to the source tree (measured: without
+    // verbatimSymlinks a ./nested.js link is recreated as an absolute path).
+    fs.cpSync(packageDir, reloadDir, { recursive: true, dereference: false, verbatimSymlinks: true });
+  } catch (err) {
+    removeReloadDir(reloadDir);
+    throw new Error(
+      `Failed to stage reload copy for "${type}": ${err instanceof Error ? err.message : String(err)}`,
+    );
+  }
+
+  try {
+    const modulePath = path.join(reloadDir, entryPoint);
+    logger.info(
+      { type, packageName: record.packageName, modulePath },
+      "Reloading external adapter (fresh copy)",
+    );
+
+    const mod = await import(pathToFileURL(modulePath).href);
+    const adapterModule = validateAdapterModule(mod, record.packageName);
+    const uiParserSource = extractUiParserSource(packageDir, record.packageName);
+
+    uiParserCache.delete(type);
+    if (uiParserSource) {
+      uiParserCache.set(adapterModule.type, uiParserSource);
     }
-  } catch {
-    // Ignore — query-string fallback still works in Node
+
+    // Retain one previous generation: in-flight work on the old module may
+    // still read sibling files, so it is pruned only when superseded again.
+    const keepDirs = [reloadDir];
+    const previous = activeReloadDirs.get(type);
+    if (previous) keepDirs.push(previous);
+    activeReloadDirs.set(type, reloadDir);
+    pruneStaleReloadDirs(pluginsDir, type, keepDirs);
+
+    logger.info(
+      { type, packageName: record.packageName, hasUiParser: !!uiParserSource },
+      "Successfully reloaded external adapter",
+    );
+
+    return adapterModule;
+  } catch (err) {
+    removeReloadDir(reloadDir);
+    throw new Error(
+      `Failed to reload adapter "${type}": ${err instanceof Error ? err.message : String(err)}`,
+    );
   }
-
-  const cacheBustUrl = `${fileUrl}?t=${Date.now()}`;
-
-  logger.info(
-    { type, packageName: record.packageName, modulePath, cacheBustUrl },
-    "Reloading external adapter (cache bust)",
-  );
-
-  const mod = await import(cacheBustUrl);
-  const adapterModule = validateAdapterModule(mod, record.packageName);
-
-  uiParserCache.delete(type);
-  const uiParserSource = extractUiParserSource(packageDir, record.packageName);
-  if (uiParserSource) {
-    uiParserCache.set(adapterModule.type, uiParserSource);
-  }
-
-  logger.info(
-    { type, packageName: record.packageName, hasUiParser: !!uiParserSource },
-    "Successfully reloaded external adapter",
-  );
-
-  return adapterModule;
 }
 
 /**
