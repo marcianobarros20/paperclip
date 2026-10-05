@@ -17,6 +17,9 @@ import {
   reloadExternalAdapter,
   sanitizeReloadDirSegment,
   validateAdapterModule,
+  withAdapterLock,
+  withAdapterLocks,
+  lockKeysForType,
 } from "./plugin-loader.js";
 
 // A minimal external adapter module. The loader calls `createServerAdapter()`
@@ -339,6 +342,170 @@ describe("reloadExternalAdapter scoped self-imports", () => {
     const reloaded = await reloadExternalAdapter("reload_fixture_scoped");
     expect(reloaded).not.toBeNull();
     expect((reloaded as unknown as Record<string, unknown>).marker).toBe("v2");
+  });
+});
+
+describe("withAdapterLock", () => {
+  const flush = () => new Promise((resolve) => setImmediate(resolve));
+
+  it("serializes sections of the same key", async () => {
+    const order: string[] = [];
+    let releaseA!: () => void;
+    const gateA = new Promise<void>((resolve) => {
+      releaseA = resolve;
+    });
+    const a = withAdapterLock("lock_same", async () => {
+      order.push("a-start");
+      await gateA;
+      order.push("a-end");
+    });
+    const b = withAdapterLock("lock_same", async () => {
+      order.push("b");
+    });
+    await flush();
+    expect(order).toEqual(["a-start"]);
+    releaseA();
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a-start", "a-end", "b"]);
+  });
+
+  it("lets different keys overlap", async () => {
+    const started = new Set<string>();
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const a = withAdapterLock("lock_x", async () => {
+      started.add("x");
+      await gate;
+    });
+    const b = withAdapterLock("lock_y", async () => {
+      started.add("y");
+      await gate;
+    });
+    await flush();
+    expect(started).toEqual(new Set(["x", "y"]));
+    release();
+    await Promise.all([a, b]);
+  });
+
+  it("runs a queued successor after a rejection", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    const a = withAdapterLock("lock_throw", async () => {
+      await gate;
+      throw new Error("boom");
+    });
+    const b = withAdapterLock("lock_throw", async () => "next");
+    await flush();
+    release();
+    await expect(a).rejects.toThrow("boom");
+    await expect(b).resolves.toBe("next");
+  });
+
+  it("blocks on any shared key", async () => {
+    const order: string[] = [];
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => {
+      release = resolve;
+    });
+    let startedA!: () => void;
+    const startedGate = new Promise<void>((resolve) => {
+      startedA = resolve;
+    });
+    const a = withAdapterLocks(["lock_m1", "lock_m2"], async () => {
+      order.push("a");
+      startedA();
+      await gate;
+    });
+    await startedGate;
+    const b = withAdapterLocks(["lock_m2"], async () => {
+      order.push("b");
+    });
+    await flush();
+    expect(order).toEqual(["a"]);
+    release();
+    await Promise.all([a, b]);
+    expect(order).toEqual(["a", "b"]);
+  });
+
+  it("derives type-plus-package keys for npm records", () => {
+    addAdapterPlugin({
+      packageName: "keys-pkg",
+      version: "1.0.0",
+      type: "reload_fixture_keys",
+      installedAt: new Date().toISOString(),
+    });
+    try {
+      expect(lockKeysForType("reload_fixture_keys")).toEqual(["type:reload_fixture_keys", "pkg:keys-pkg"]);
+      expect(lockKeysForType("missing_type")).toEqual(["type:missing_type"]);
+    } finally {
+      removeAdapterPlugin("reload_fixture_keys");
+    }
+  });
+
+  describe("queued reload behind a held key", () => {
+    const prevHome = process.env.PAPERCLIP_HOME;
+    let home = "";
+    let pkgDir = "";
+
+    beforeEach(async () => {
+      home = await fs.mkdtemp(path.join(os.tmpdir(), "paperclip-reload-lock-"));
+      process.env.PAPERCLIP_HOME = home;
+      pkgDir = path.join(home, "adapter-plugins", "node_modules", "lock-pkg");
+      await fs.mkdir(path.join(pkgDir, "dist"), { recursive: true });
+      await fs.writeFile(
+        path.join(pkgDir, "package.json"),
+        JSON.stringify({ name: "lock-pkg", version: "1.0.0", main: "dist/index.js" }),
+      );
+      await fs.writeFile(
+        path.join(pkgDir, "dist", "index.js"),
+        'import { NESTED_VALUE } from "./nested.js";\n' +
+          "export function createServerAdapter() {\n" +
+          '  return { type: "reload_fixture_lock", execute: async () => ({}), testEnvironment: async () => ({}), marker: NESTED_VALUE };\n' +
+          "}\n",
+      );
+      await fs.writeFile(path.join(pkgDir, "dist", "nested.js"), 'export const NESTED_VALUE = "v1";\n');
+      addAdapterPlugin({
+        packageName: "lock-pkg",
+        version: "1.0.0",
+        type: "reload_fixture_lock",
+        installedAt: new Date().toISOString(),
+      });
+    });
+
+    afterEach(async () => {
+      removeAdapterPlugin("reload_fixture_lock");
+      if (prevHome === undefined) delete process.env.PAPERCLIP_HOME;
+      else process.env.PAPERCLIP_HOME = prevHome;
+      await fs.rm(home, { recursive: true, force: true });
+    });
+
+    async function reloadBehindHeldKey(key: string): Promise<unknown> {
+      let release!: () => void;
+      const gate = new Promise<void>((resolve) => {
+        release = resolve;
+      });
+      const holder = withAdapterLock(key, () => gate);
+      const reloaded = reloadExternalAdapter("reload_fixture_lock");
+      await flush();
+      await fs.writeFile(path.join(pkgDir, "dist", "nested.js"), 'export const NESTED_VALUE = "v2";\n');
+      release();
+      await holder;
+      return reloaded;
+    }
+
+    it("queues behind a held type key", async () => {
+      const mod = await reloadBehindHeldKey("type:reload_fixture_lock");
+      expect((mod as unknown as Record<string, unknown>).marker).toBe("v2");
+    });
+
+    it("queues behind a held package key", async () => {
+      const mod = await reloadBehindHeldKey("pkg:lock-pkg");
+      expect((mod as unknown as Record<string, unknown>).marker).toBe("v2");
+    });
   });
 });
 

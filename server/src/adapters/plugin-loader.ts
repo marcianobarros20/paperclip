@@ -218,7 +218,38 @@ async function loadFromRecord(record: AdapterPluginRecord): Promise<ServerAdapte
 const RELOAD_DIR_PREFIX = ".reload-";
 const RELOAD_DIR_TTL_MS = 3_600_000;
 const activeReloadDirs = new Map<string, string>();
-const reloadChains = new Map<string, Promise<ServerAdapterModule | null>>();
+const typeLocks = new Map<string, Promise<unknown>>();
+
+export function lockKeysForType(type: string): string[] {
+  const record = getAdapterPluginByType(type);
+  if (!record || record.localPath || !record.packageName) return [`type:${type}`];
+  return [`type:${type}`, `pkg:${record.packageName}`];
+}
+
+/**
+ * Non-reentrant per-key promise-chain mutex. A rejection never breaks the
+ * chain: queued sections still run. Keys use `type:<adapterType>` and
+ * `pkg:<packageName>` namespaces; multi-key sections must take type before
+ * pkg. Callers already holding a key must use the `lockHeld` escape hatch
+ * instead of re-entering, or they self-deadlock.
+ */
+export async function withAdapterLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  const previousRun = typeLocks.get(key) ?? Promise.resolve();
+  const run = previousRun.catch(() => undefined).then(fn);
+  typeLocks.set(key, run);
+  try {
+    return await run;
+  } finally {
+    if (typeLocks.get(key) === run) typeLocks.delete(key);
+  }
+}
+
+export async function withAdapterLocks<T>(keys: string[], fn: () => Promise<T>): Promise<T> {
+  const ordered = [...new Set(keys)];
+  const run = async (index: number): Promise<T> =>
+    index >= ordered.length ? fn() : withAdapterLock(ordered[index], () => run(index + 1));
+  return run(0);
+}
 
 function escapeRegExp(value: string): string {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
@@ -343,19 +374,16 @@ function removeReloadDir(dir: string): void {
  * only the entry point while nested relative imports resolve to cached URLs.
  * Returns null only when no plugin record exists; staging and import failures
  * throw so routes report 500 with the cause instead of a misleading 404. The
- * previous module stays registered on every failure path.
+ * previous module stays registered on every failure path. Serialized per
+ * type (plus package for npm records); pass `lockHeld` only when the caller
+ * already holds this type's keys via withAdapterLocks.
  */
 export async function reloadExternalAdapter(
   type: string,
+  opts?: { lockHeld?: boolean },
 ): Promise<ServerAdapterModule | null> {
-  const previousRun = reloadChains.get(type) ?? Promise.resolve(null);
-  const run = previousRun.catch(() => null).then(() => reloadInner(type));
-  reloadChains.set(type, run);
-  try {
-    return await run;
-  } finally {
-    if (reloadChains.get(type) === run) reloadChains.delete(type);
-  }
+  if (opts?.lockHeld) return reloadInner(type);
+  return withAdapterLocks(lockKeysForType(type), () => reloadInner(type));
 }
 
 async function reloadInner(type: string): Promise<ServerAdapterModule | null> {
