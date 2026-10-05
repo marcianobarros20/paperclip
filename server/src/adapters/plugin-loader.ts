@@ -310,8 +310,10 @@ function pruneStaleReloadDirs(pluginsDir: string, type: string, keepDirs: string
   }
 }
 
-export function pruneReloadDirsForType(type: string): void {
+export function pruneReloadDirsForType(type: string, opts?: { keepActive?: boolean }): void {
   const pluginsDir = getAdapterPluginsDir();
+  const keep = opts?.keepActive ? activeReloadDirs.get(type) : undefined;
+  const keepResolved = keep === undefined ? undefined : path.resolve(keep);
   let entries: string[];
   try {
     entries = fs.readdirSync(pluginsDir);
@@ -320,6 +322,7 @@ export function pruneReloadDirsForType(type: string): void {
   }
   for (const entry of entries) {
     if (!isReloadDirEntry(entry, type)) continue;
+    if (keepResolved !== undefined && path.resolve(pluginsDir, entry) === keepResolved) continue;
     removeReloadDir(path.join(pluginsDir, entry));
   }
   activeReloadDirs.delete(type);

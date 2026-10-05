@@ -584,8 +584,10 @@ export function adapterRoutes(options: {
       // Remove from the persistent store
       removeAdapterPlugin(adapterType);
 
-      // Reclaim reload staging copies.
-      pruneReloadDirsForType(adapterType);
+      // Reclaim reload staging copies, sparing the live copy: a running
+      // session may still import siblings from it. The map entry is still
+      // cleared, so startup prune reclaims the spared copy on restart.
+      pruneReloadDirsForType(adapterType, { keepActive: true });
     });
 
     logger.info({ type: adapterType }, "External adapter unregistered and removed");

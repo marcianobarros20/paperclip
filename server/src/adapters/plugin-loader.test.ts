@@ -14,6 +14,7 @@ import {
   loadExternalAdapterPackage,
   pruneAllReloadDirs,
   pruneReloadDirsForType,
+  reloadDirNameForType,
   reloadExternalAdapter,
   sanitizeReloadDirSegment,
   validateAdapterModule,
@@ -171,6 +172,30 @@ describe("reloadExternalAdapter nested freshness", () => {
     const pluginsDir = path.join(home, "adapter-plugins");
     const entries = await fs.readdir(pluginsDir);
     expect(entries.filter((name) => isReloadDirEntry(name, "reload_fixture_nested")).length).toBeLessThanOrEqual(2);
+  });
+
+  it("keepActive prunes stale generations but spares the live copy", async () => {
+    await writeNested("v2");
+    await reloadExternalAdapter("reload_fixture_nested");
+    const pluginsDir = path.join(home, "adapter-plugins");
+    const before = (await fs.readdir(pluginsDir)).filter((name) =>
+      isReloadDirEntry(name, "reload_fixture_nested"),
+    );
+    expect(before).toHaveLength(1);
+
+    const stale = reloadDirNameForType("reload_fixture_nested");
+    expect(stale).not.toBe(before[0]);
+    await fs.mkdir(path.join(pluginsDir, stale), { recursive: true });
+
+    pruneReloadDirsForType("reload_fixture_nested", { keepActive: true });
+
+    const after = await fs.readdir(pluginsDir);
+    expect(after).toContain(before[0]);
+    expect(after).not.toContain(stale);
+
+    // The map entry is cleared, so startup prune reclaims the spared copy.
+    pruneAllReloadDirs();
+    expect(await fs.readdir(pluginsDir)).not.toContain(before[0]);
   });
 
   it("throws on staging failure, keeping the record and leaking no copy", async () => {
